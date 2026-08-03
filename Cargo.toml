@@ -107,6 +107,10 @@ workspace = true
 
 [target.'cfg(all(unix, not(target_os = "ios"), not(target_os = "macos")))'.dependencies]
 hal = { workspace = true, features = ["renderdoc"] }
+# Raw Vulkan handles for wgpuDeviceCreateTextureWithExportedFd. Same version
+# wgpu-hal pins, so vk::Image and friends are the identical types across the
+# boundary; a mismatch would compile and then hand Vulkan the wrong struct.
+ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
 hal = { workspace = true, features = ["dx12", "renderdoc"] }

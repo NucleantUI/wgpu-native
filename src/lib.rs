@@ -4870,3 +4870,241 @@ pub unsafe extern "C" fn wgpuRenderPassEncoderWriteTimestamp(
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// External-memory texture export (Linux / Android)
+// ---------------------------------------------------------------------------
+//
+// Creates a texture whose backing memory is exportable through
+// `VK_KHR_external_memory_fd` and hands back the fd, so another Vulkan device
+// can import the same allocation with `VkImportMemoryFdInfoKHR` and render to
+// or sample from it without a copy. Nothing upstream exposes this: wgpu always
+// allocates through its own allocator, and neither wgpu-core nor wgpu-native
+// has a way to ask for exportable memory.
+//
+// Vulkan-only by construction, and the extension is optional even there —
+// wgpu-hal enables `VK_KHR_external_memory_fd` when the physical device
+// supports it (see its adapter.rs), so a device that lacks it returns null here
+// and the caller falls back to whatever copy path it has.
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
+    device: native::WGPUDevice,
+    descriptor: Option<&native::WGPUTextureDescriptor>,
+    out_fd: *mut i32,
+) -> native::WGPUTexture {
+    use ash::vk;
+
+    if !out_fd.is_null() {
+        *out_fd = -1;
+    }
+
+    let (device_id, context, error_sink) = {
+        let device = device.as_ref().expect("invalid device");
+        (device.id, &device.context, &device.error_sink)
+    };
+    let descriptor = descriptor.expect("invalid descriptor");
+
+    let desc = wgt::TextureDescriptor {
+        label: string_view_into_label(descriptor.label),
+        size: conv::map_extent3d(&descriptor.size),
+        mip_level_count: descriptor.mipLevelCount,
+        sample_count: descriptor.sampleCount,
+        dimension: conv::map_texture_dimension(descriptor.dimension)
+            .unwrap_or(wgt::TextureDimension::D2),
+        format: conv::map_texture_format(descriptor.format)
+            .expect("invalid texture format for texture descriptor"),
+        usage: from_u64_bits(descriptor.usage)
+            .expect("invalid texture usage for texture descriptor"),
+        view_formats: make_slice(descriptor.viewFormats, descriptor.viewFormatCount)
+            .iter()
+            .map(|v| conv::map_texture_format(*v).expect("invalid view format"))
+            .collect(),
+    };
+
+    // Only the plain render-target shape is supported: the importer maps this
+    // memory as a colour attachment it also samples and copies. Storage use
+    // would need a different tiling/usage pair on both sides.
+    let mut vk_usage = vk::ImageUsageFlags::empty();
+    if desc.usage.contains(wgt::TextureUsages::COPY_SRC) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+    }
+    if desc.usage.contains(wgt::TextureUsages::COPY_DST) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_DST;
+    }
+    if desc.usage.contains(wgt::TextureUsages::TEXTURE_BINDING) {
+        vk_usage |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if desc.usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT) {
+        vk_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    }
+
+    // Only the colour formats an imported render target is ever created with.
+    // wgpu-hal's own wgt -> vk table is private, and a partial match is safer
+    // here than a guess: an unlisted format returns null and the caller falls
+    // back rather than exporting memory the importer would misread.
+    let vk_format = match desc.format {
+        wgt::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        wgt::TextureFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        wgt::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        wgt::TextureFormat::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
+        wgt::TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        _ => return std::ptr::null_mut(),
+    };
+
+    let hal_device = match context.device_as_hal::<hal::api::Vulkan>(device_id) {
+        Some(d) => d,
+        // Not a Vulkan device — nothing to export.
+        None => return std::ptr::null_mut(),
+    };
+
+    let raw_device = hal_device.raw_device().clone();
+    let physical = hal_device.raw_physical_device();
+    let instance = hal_device.shared_instance().raw_instance().clone();
+
+    // Image and memory are built by hand rather than through wgpu's allocator:
+    // the export has to be declared at creation time, and the allocator has no
+    // way to pass VkExportMemoryAllocateInfo down.
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk_format)
+        .extent(vk::Extent3D {
+            width: desc.size.width,
+            height: desc.size.height,
+            depth: 1,
+        })
+        .mip_levels(desc.mip_level_count)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk_usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external_info);
+
+    let image = match raw_device.create_image(&image_info, None) {
+        Ok(i) => i,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let reqs = raw_device.get_image_memory_requirements(image);
+    let mem_props = instance.get_physical_device_memory_properties(physical);
+    let mut type_index = None;
+    for i in 0..mem_props.memory_type_count {
+        let supported = reqs.memory_type_bits & (1 << i) != 0;
+        let local = mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        if supported && local {
+            type_index = Some(i);
+            break;
+        }
+    }
+    let Some(type_index) = type_index else {
+        raw_device.destroy_image(image, None);
+        return std::ptr::null_mut();
+    };
+
+    let mut export_info = vk::ExportMemoryAllocateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+    // Dedicated: an exported image's memory must not be suballocated, or the
+    // importer receives an fd for the whole heap block and reads the wrong
+    // offset.
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index)
+        .push_next(&mut export_info)
+        .push_next(&mut dedicated);
+
+    let memory = match raw_device.allocate_memory(&alloc_info, None) {
+        Ok(m) => m,
+        Err(_) => {
+            raw_device.destroy_image(image, None);
+            return std::ptr::null_mut();
+        }
+    };
+
+    if raw_device.bind_image_memory(image, memory, 0).is_err() {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return std::ptr::null_mut();
+    }
+
+    let fd_device = ash::khr::external_memory_fd::Device::new(&instance, &raw_device);
+    let fd_info = vk::MemoryGetFdInfoKHR::default()
+        .memory(memory)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+    let fd = match fd_device.get_memory_fd(&fd_info) {
+        Ok(fd) => fd,
+        Err(_) => {
+            raw_device.free_memory(memory, None);
+            raw_device.destroy_image(image, None);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let hal_desc = hal::TextureDescriptor {
+        label: desc.label.as_deref(),
+        size: desc.size,
+        mip_level_count: desc.mip_level_count,
+        sample_count: desc.sample_count,
+        dimension: desc.dimension,
+        format: desc.format,
+        usage: wgt::TextureUses::COLOR_TARGET
+            | wgt::TextureUses::RESOURCE
+            | wgt::TextureUses::COPY_SRC
+            | wgt::TextureUses::COPY_DST,
+        memory_flags: hal::MemoryFlags::empty(),
+        view_formats: desc.view_formats.clone(),
+    };
+
+    // TextureMemory::External tells wgpu the allocation is not its to free, so
+    // the drop callback is what releases both handles when the texture dies.
+    let cleanup_device = raw_device.clone();
+    let hal_texture = hal_device.texture_from_raw(
+        image,
+        &hal_desc,
+        Some(Box::new(move || {
+            cleanup_device.destroy_image(image, None);
+            cleanup_device.free_memory(memory, None);
+        })),
+        hal::vulkan::TextureMemory::External,
+    );
+    drop(hal_device);
+
+    let (texture_id, error) =
+        context.create_texture_from_hal(Box::new(hal_texture), device_id, &desc, None);
+    if let Some(cause) = error {
+        handle_error(
+            error_sink,
+            cause,
+            desc.label,
+            "wgpuDeviceCreateTextureWithExportedFd",
+        );
+    }
+
+    if !out_fd.is_null() {
+        *out_fd = fd;
+    }
+
+    Arc::into_raw(Arc::new(WGPUTextureImpl {
+        context: context.clone(),
+        id: texture_id,
+        error_sink: error_sink.clone(),
+        surface_id: None,
+        has_surface_presented: Arc::default(),
+        data: TextureData {
+            usage: descriptor.usage,
+            dimension: descriptor.dimension,
+            size: descriptor.size,
+            format: descriptor.format,
+            mip_level_count: descriptor.mipLevelCount,
+            sample_count: descriptor.sampleCount,
+        },
+    }))
+}
