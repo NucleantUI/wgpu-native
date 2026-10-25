@@ -1499,6 +1499,12 @@ extern "C"
     // by a successful VkImportMemoryFdInfoKHR import.
     WGPUTexture wgpuDeviceCreateTextureWithExportedFd(WGPUDevice device, WGPUTextureDescriptor const *descriptor, int32_t *out_fd);
 #endif
+#if defined(_WIN32)
+    // VK_KHR_external_memory_win32 (OPAQUE_WIN32). The HANDLE is owned by the
+    // caller and is not consumed by importing it: CloseHandle it once the
+    // VkImportMemoryWin32HandleInfoKHR import is done.
+    WGPUTexture wgpuDeviceCreateTextureWithExportedWin32Handle(WGPUDevice device, WGPUTextureDescriptor const *descriptor, void **out_handle);
+#endif
 #if defined(__ANDROID__)
     // VK_ANDROID_external_memory_android_hardware_buffer. Android's own handle
     // type, and the only one it guarantees. The returned AHardwareBuffer* holds
