@@ -114,6 +114,9 @@ ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
 hal = { workspace = true, features = ["dx12", "renderdoc"] }
+# Raw Vulkan handles for wgpuDeviceCreateTextureWithExportedWin32Handle, as for
+# the fd entry point above.
+ash = "0.38"
 
 [dependencies.wgt]
 workspace = true
