@@ -4896,7 +4896,7 @@ pub unsafe extern "C" fn wgpuRenderPassEncoderWriteTimestamp(
 //
 // The returned AHardwareBuffer carries a reference that belongs to the caller;
 // release it with AHardwareBuffer_release once the import is done.
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "vulkan", target_os = "android"))]
 #[no_mangle]
 pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
     device: native::WGPUDevice,
@@ -4966,8 +4966,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
 
     let handle_type = vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID;
 
-    let mut external_info =
-        vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
 
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -5037,7 +5036,10 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
     let get_ahb: vk::PFN_vkGetMemoryAndroidHardwareBufferANDROID = {
         let name = c"vkGetMemoryAndroidHardwareBufferANDROID";
         match (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr()) {
-            Some(f) => core::mem::transmute(f),
+            Some(f) => core::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkGetMemoryAndroidHardwareBufferANDROID,
+            >(f),
             None => {
                 raw_device.free_memory(memory, None);
                 raw_device.destroy_image(image, None);
@@ -5093,7 +5095,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
     }
 
     if !out_buffer.is_null() {
-        *out_buffer = ahb as *mut core::ffi::c_void;
+        *out_buffer = ahb;
     }
 
     Arc::into_raw(Arc::new(WGPUTextureImpl {
@@ -5113,7 +5115,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
     }))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "vulkan", any(target_os = "linux", target_os = "android")))]
 #[no_mangle]
 pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
     device: native::WGPUDevice,
@@ -5270,7 +5272,9 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
         let name = c"vkGetMemoryFdKHR";
         let addr = (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr());
         match addr {
-            Some(f) => std::mem::transmute(f),
+            Some(f) => {
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetMemoryFdKHR>(f)
+            }
             None => {
                 raw_device.free_memory(memory, None);
                 raw_device.destroy_image(image, None);
@@ -5359,7 +5363,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
 //
 // The handle belongs to the caller. Unlike an fd, importing it does not
 // consume it: close it with CloseHandle once the import is done.
-#[cfg(windows)]
+#[cfg(all(feature = "vulkan", windows))]
 #[no_mangle]
 pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedWin32Handle(
     device: native::WGPUDevice,
@@ -5430,8 +5434,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedWin32Handle(
 
     let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
 
-    let mut external_info =
-        vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
 
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -5503,7 +5506,10 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedWin32Handle(
     let get_win32_handle: vk::PFN_vkGetMemoryWin32HandleKHR = {
         let name = c"vkGetMemoryWin32HandleKHR";
         match (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr()) {
-            Some(f) => core::mem::transmute(f),
+            Some(f) => core::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkGetMemoryWin32HandleKHR,
+            >(f),
             None => {
                 raw_device.free_memory(memory, None);
                 raw_device.destroy_image(image, None);
