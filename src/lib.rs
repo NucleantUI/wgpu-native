@@ -4887,7 +4887,235 @@ pub unsafe extern "C" fn wgpuRenderPassEncoderWriteTimestamp(
 // supports it (see its adapter.rs), so a device that lacks it returns null here
 // and the caller falls back to whatever copy path it has.
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// Android's own external-memory handle type, and the only one it guarantees:
+// the emulator exposes VK_ANDROID_external_memory_android_hardware_buffer but
+// not VK_KHR_external_memory_fd, so the fd entry point above cannot work there.
+// Same shape otherwise — allocate exportable, hand back the handle, let the
+// caller import it on its own device with VkImportAndroidHardwareBufferInfo
+// ANDROID.
+//
+// The returned AHardwareBuffer carries a reference that belongs to the caller;
+// release it with AHardwareBuffer_release once the import is done.
+#[cfg(all(feature = "vulkan", target_os = "android"))]
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedAHardwareBuffer(
+    device: native::WGPUDevice,
+    descriptor: Option<&native::WGPUTextureDescriptor>,
+    out_buffer: *mut *mut core::ffi::c_void,
+) -> native::WGPUTexture {
+    use ash::vk;
+
+    if !out_buffer.is_null() {
+        *out_buffer = core::ptr::null_mut();
+    }
+
+    let (device_id, context, error_sink) = {
+        let device = device.as_ref().expect("invalid device");
+        (device.id, &device.context, &device.error_sink)
+    };
+    let descriptor = descriptor.expect("invalid descriptor");
+
+    let desc = wgt::TextureDescriptor {
+        label: string_view_into_label(descriptor.label),
+        size: conv::map_extent3d(&descriptor.size),
+        mip_level_count: descriptor.mipLevelCount,
+        sample_count: descriptor.sampleCount,
+        dimension: conv::map_texture_dimension(descriptor.dimension)
+            .unwrap_or(wgt::TextureDimension::D2),
+        format: conv::map_texture_format(descriptor.format)
+            .expect("invalid texture format for texture descriptor"),
+        usage: from_u64_bits(descriptor.usage)
+            .expect("invalid texture usage for texture descriptor"),
+        view_formats: make_slice(descriptor.viewFormats, descriptor.viewFormatCount)
+            .iter()
+            .map(|v| conv::map_texture_format(*v).expect("invalid view format"))
+            .collect::<Vec<_>>(),
+    };
+
+    let mut vk_usage = vk::ImageUsageFlags::empty();
+    if desc.usage.contains(wgt::TextureUsages::COPY_SRC) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+    }
+    if desc.usage.contains(wgt::TextureUsages::COPY_DST) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_DST;
+    }
+    if desc.usage.contains(wgt::TextureUsages::TEXTURE_BINDING) {
+        vk_usage |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if desc.usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT) {
+        vk_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    }
+
+    let vk_format = match desc.format {
+        wgt::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        wgt::TextureFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        wgt::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        wgt::TextureFormat::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
+        wgt::TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        _ => return core::ptr::null_mut(),
+    };
+
+    let hal_device = match context.device_as_hal::<hal::api::Vulkan>(device_id) {
+        Some(d) => d,
+        None => return core::ptr::null_mut(),
+    };
+
+    let raw_device = hal_device.raw_device().clone();
+    let physical = hal_device.raw_physical_device();
+    let instance = hal_device.shared_instance().raw_instance().clone();
+
+    let handle_type = vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID;
+
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk_format)
+        .extent(vk::Extent3D {
+            width: desc.size.width,
+            height: desc.size.height,
+            depth: 1,
+        })
+        .mip_levels(desc.mip_level_count)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk_usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external_info);
+
+    let image = match raw_device.create_image(&image_info, None) {
+        Ok(i) => i,
+        Err(_) => return core::ptr::null_mut(),
+    };
+
+    let reqs = raw_device.get_image_memory_requirements(image);
+    let mem_props = instance.get_physical_device_memory_properties(physical);
+    let mut type_index = None;
+    for i in 0..mem_props.memory_type_count {
+        let supported = reqs.memory_type_bits & (1 << i) != 0;
+        let local = mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        if supported && local {
+            type_index = Some(i);
+            break;
+        }
+    }
+    let Some(type_index) = type_index else {
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    };
+
+    let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index)
+        .push_next(&mut export_info)
+        .push_next(&mut dedicated);
+
+    let memory = match raw_device.allocate_memory(&alloc_info, None) {
+        Ok(m) => m,
+        Err(_) => {
+            raw_device.destroy_image(image, None);
+            return core::ptr::null_mut();
+        }
+    };
+
+    if raw_device.bind_image_memory(image, memory, 0).is_err() {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    }
+
+    // Looked up by hand for the same reason as the fd path: ash's generated
+    // loader panics when the entry point is missing, and unwinding out of an
+    // extern "C" function is an abort.
+    let get_ahb: vk::PFN_vkGetMemoryAndroidHardwareBufferANDROID = {
+        let name = c"vkGetMemoryAndroidHardwareBufferANDROID";
+        match (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr()) {
+            Some(f) => core::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkGetMemoryAndroidHardwareBufferANDROID,
+            >(f),
+            None => {
+                raw_device.free_memory(memory, None);
+                raw_device.destroy_image(image, None);
+                return core::ptr::null_mut();
+            }
+        }
+    };
+
+    let ahb_info = vk::MemoryGetAndroidHardwareBufferInfoANDROID::default().memory(memory);
+    let mut ahb: *mut vk::AHardwareBuffer = core::ptr::null_mut();
+    if get_ahb(raw_device.handle(), &ahb_info, &mut ahb) != vk::Result::SUCCESS || ahb.is_null() {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    }
+
+    let hal_desc = hal::TextureDescriptor {
+        label: desc.label.as_deref(),
+        size: desc.size,
+        mip_level_count: desc.mip_level_count,
+        sample_count: desc.sample_count,
+        dimension: desc.dimension,
+        format: desc.format,
+        usage: wgt::TextureUses::COLOR_TARGET
+            | wgt::TextureUses::RESOURCE
+            | wgt::TextureUses::COPY_SRC
+            | wgt::TextureUses::COPY_DST,
+        memory_flags: hal::MemoryFlags::empty(),
+        view_formats: desc.view_formats.clone(),
+    };
+
+    let cleanup_device = raw_device.clone();
+    let hal_texture = hal_device.texture_from_raw(
+        image,
+        &hal_desc,
+        Some(Box::new(move || {
+            cleanup_device.destroy_image(image, None);
+            cleanup_device.free_memory(memory, None);
+        })),
+        hal::vulkan::TextureMemory::External,
+    );
+    drop(hal_device);
+
+    let (texture_id, error) =
+        context.create_texture_from_hal(Box::new(hal_texture), device_id, &desc, None);
+    if let Some(cause) = error {
+        handle_error(
+            error_sink,
+            cause,
+            desc.label,
+            "wgpuDeviceCreateTextureWithExportedAHardwareBuffer",
+        );
+    }
+
+    if !out_buffer.is_null() {
+        *out_buffer = ahb;
+    }
+
+    Arc::into_raw(Arc::new(WGPUTextureImpl {
+        context: context.clone(),
+        id: texture_id,
+        error_sink: error_sink.clone(),
+        surface_id: None,
+        has_surface_presented: Arc::default(),
+        data: TextureData {
+            usage: descriptor.usage,
+            dimension: descriptor.dimension,
+            size: descriptor.size,
+            format: descriptor.format,
+            mip_level_count: descriptor.mipLevelCount,
+            sample_count: descriptor.sampleCount,
+        },
+    }))
+}
+
+#[cfg(all(feature = "vulkan", any(target_os = "linux", target_os = "android")))]
 #[no_mangle]
 pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
     device: native::WGPUDevice,
@@ -4920,7 +5148,7 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
         view_formats: make_slice(descriptor.viewFormats, descriptor.viewFormatCount)
             .iter()
             .map(|v| conv::map_texture_format(*v).expect("invalid view format"))
-            .collect(),
+            .collect::<Vec<_>>(),
     };
 
     // Only the plain render-target shape is supported: the importer maps this
@@ -5035,18 +5263,36 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
         return std::ptr::null_mut();
     }
 
-    let fd_device = ash::khr::external_memory_fd::Device::new(&instance, &raw_device);
+    // vkGetMemoryFdKHR looked up by hand rather than through ash's generated
+    // loader: that one panics when the entry point is absent, and this is an
+    // extern "C" function, where unwinding is an abort. The extension is
+    // optional — wgpu-hal enables it only when the physical device advertises
+    // it — so absence is an ordinary outcome to report, not a crash.
+    let get_memory_fd: vk::PFN_vkGetMemoryFdKHR = {
+        let name = c"vkGetMemoryFdKHR";
+        let addr = (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr());
+        match addr {
+            Some(f) => {
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetMemoryFdKHR>(f)
+            }
+            None => {
+                raw_device.free_memory(memory, None);
+                raw_device.destroy_image(image, None);
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
     let fd_info = vk::MemoryGetFdInfoKHR::default()
         .memory(memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
-    let fd = match fd_device.get_memory_fd(&fd_info) {
-        Ok(fd) => fd,
-        Err(_) => {
-            raw_device.free_memory(memory, None);
-            raw_device.destroy_image(image, None);
-            return std::ptr::null_mut();
-        }
-    };
+    let mut fd: i32 = -1;
+    let fd_result = get_memory_fd(raw_device.handle(), &fd_info, &mut fd);
+    if fd_result != vk::Result::SUCCESS || fd < 0 {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return std::ptr::null_mut();
+    }
 
     let hal_desc = hal::TextureDescriptor {
         label: desc.label.as_deref(),
@@ -5090,6 +5336,241 @@ pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedFd(
 
     if !out_fd.is_null() {
         *out_fd = fd;
+    }
+
+    Arc::into_raw(Arc::new(WGPUTextureImpl {
+        context: context.clone(),
+        id: texture_id,
+        error_sink: error_sink.clone(),
+        surface_id: None,
+        has_surface_presented: Arc::default(),
+        data: TextureData {
+            usage: descriptor.usage,
+            dimension: descriptor.dimension,
+            size: descriptor.size,
+            format: descriptor.format,
+            mip_level_count: descriptor.mipLevelCount,
+            sample_count: descriptor.sampleCount,
+        },
+    }))
+}
+
+// Windows' counterpart of the fd entry point: the same exportable texture, its
+// memory handed back as an NT handle through `VK_KHR_external_memory_win32`
+// (OPAQUE_WIN32), which another Vulkan device imports with
+// `VkImportMemoryWin32HandleInfoKHR`. wgpu-hal enables the extension whenever
+// the physical device supports it, as it does the fd one elsewhere.
+//
+// The handle belongs to the caller. Unlike an fd, importing it does not
+// consume it: close it with CloseHandle once the import is done.
+#[cfg(all(feature = "vulkan", windows))]
+#[no_mangle]
+pub unsafe extern "C" fn wgpuDeviceCreateTextureWithExportedWin32Handle(
+    device: native::WGPUDevice,
+    descriptor: Option<&native::WGPUTextureDescriptor>,
+    out_handle: *mut *mut core::ffi::c_void,
+) -> native::WGPUTexture {
+    use ash::vk;
+
+    if !out_handle.is_null() {
+        *out_handle = core::ptr::null_mut();
+    }
+
+    let (device_id, context, error_sink) = {
+        let device = device.as_ref().expect("invalid device");
+        (device.id, &device.context, &device.error_sink)
+    };
+    let descriptor = descriptor.expect("invalid descriptor");
+
+    let desc = wgt::TextureDescriptor {
+        label: string_view_into_label(descriptor.label),
+        size: conv::map_extent3d(&descriptor.size),
+        mip_level_count: descriptor.mipLevelCount,
+        sample_count: descriptor.sampleCount,
+        dimension: conv::map_texture_dimension(descriptor.dimension)
+            .unwrap_or(wgt::TextureDimension::D2),
+        format: conv::map_texture_format(descriptor.format)
+            .expect("invalid texture format for texture descriptor"),
+        usage: from_u64_bits(descriptor.usage)
+            .expect("invalid texture usage for texture descriptor"),
+        view_formats: make_slice(descriptor.viewFormats, descriptor.viewFormatCount)
+            .iter()
+            .map(|v| conv::map_texture_format(*v).expect("invalid view format"))
+            .collect::<Vec<_>>(),
+    };
+
+    let mut vk_usage = vk::ImageUsageFlags::empty();
+    if desc.usage.contains(wgt::TextureUsages::COPY_SRC) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+    }
+    if desc.usage.contains(wgt::TextureUsages::COPY_DST) {
+        vk_usage |= vk::ImageUsageFlags::TRANSFER_DST;
+    }
+    if desc.usage.contains(wgt::TextureUsages::TEXTURE_BINDING) {
+        vk_usage |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if desc.usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT) {
+        vk_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    }
+
+    let vk_format = match desc.format {
+        wgt::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        wgt::TextureFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        wgt::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        wgt::TextureFormat::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
+        wgt::TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        _ => return core::ptr::null_mut(),
+    };
+
+    // Not a Vulkan device (wgpu picked DX12, say) — nothing to export.
+    let hal_device = match context.device_as_hal::<hal::api::Vulkan>(device_id) {
+        Some(d) => d,
+        None => return core::ptr::null_mut(),
+    };
+
+    let raw_device = hal_device.raw_device().clone();
+    let physical = hal_device.raw_physical_device();
+    let instance = hal_device.shared_instance().raw_instance().clone();
+
+    let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
+
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk_format)
+        .extent(vk::Extent3D {
+            width: desc.size.width,
+            height: desc.size.height,
+            depth: 1,
+        })
+        .mip_levels(desc.mip_level_count)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk_usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external_info);
+
+    let image = match raw_device.create_image(&image_info, None) {
+        Ok(i) => i,
+        Err(_) => return core::ptr::null_mut(),
+    };
+
+    let reqs = raw_device.get_image_memory_requirements(image);
+    let mem_props = instance.get_physical_device_memory_properties(physical);
+    let mut type_index = None;
+    for i in 0..mem_props.memory_type_count {
+        let supported = reqs.memory_type_bits & (1 << i) != 0;
+        let local = mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        if supported && local {
+            type_index = Some(i);
+            break;
+        }
+    }
+    let Some(type_index) = type_index else {
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    };
+
+    // No VkExportMemoryWin32HandleInfoKHR: its defaults (no security
+    // attributes, the access an importer needs) are what this wants.
+    let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index)
+        .push_next(&mut export_info)
+        .push_next(&mut dedicated);
+
+    let memory = match raw_device.allocate_memory(&alloc_info, None) {
+        Ok(m) => m,
+        Err(_) => {
+            raw_device.destroy_image(image, None);
+            return core::ptr::null_mut();
+        }
+    };
+
+    if raw_device.bind_image_memory(image, memory, 0).is_err() {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    }
+
+    // Looked up by hand for the same reason as the fd path: ash's generated
+    // loader panics when the entry point is missing, and unwinding out of an
+    // extern "C" function is an abort.
+    let get_win32_handle: vk::PFN_vkGetMemoryWin32HandleKHR = {
+        let name = c"vkGetMemoryWin32HandleKHR";
+        match (instance.fp_v1_0().get_device_proc_addr)(raw_device.handle(), name.as_ptr()) {
+            Some(f) => core::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkGetMemoryWin32HandleKHR,
+            >(f),
+            None => {
+                raw_device.free_memory(memory, None);
+                raw_device.destroy_image(image, None);
+                return core::ptr::null_mut();
+            }
+        }
+    };
+
+    let handle_info = vk::MemoryGetWin32HandleInfoKHR::default()
+        .memory(memory)
+        .handle_type(handle_type);
+    // vk::HANDLE is an isize in ash; 0 is no handle.
+    let mut handle: vk::HANDLE = 0;
+    if get_win32_handle(raw_device.handle(), &handle_info, &mut handle) != vk::Result::SUCCESS
+        || handle == 0
+    {
+        raw_device.free_memory(memory, None);
+        raw_device.destroy_image(image, None);
+        return core::ptr::null_mut();
+    }
+
+    let hal_desc = hal::TextureDescriptor {
+        label: desc.label.as_deref(),
+        size: desc.size,
+        mip_level_count: desc.mip_level_count,
+        sample_count: desc.sample_count,
+        dimension: desc.dimension,
+        format: desc.format,
+        usage: wgt::TextureUses::COLOR_TARGET
+            | wgt::TextureUses::RESOURCE
+            | wgt::TextureUses::COPY_SRC
+            | wgt::TextureUses::COPY_DST,
+        memory_flags: hal::MemoryFlags::empty(),
+        view_formats: desc.view_formats.clone(),
+    };
+
+    let cleanup_device = raw_device.clone();
+    let hal_texture = hal_device.texture_from_raw(
+        image,
+        &hal_desc,
+        Some(Box::new(move || {
+            cleanup_device.destroy_image(image, None);
+            cleanup_device.free_memory(memory, None);
+        })),
+        hal::vulkan::TextureMemory::External,
+    );
+    drop(hal_device);
+
+    let (texture_id, error) =
+        context.create_texture_from_hal(Box::new(hal_texture), device_id, &desc, None);
+    if let Some(cause) = error {
+        handle_error(
+            error_sink,
+            cause,
+            desc.label,
+            "wgpuDeviceCreateTextureWithExportedWin32Handle",
+        );
+    }
+
+    if !out_handle.is_null() {
+        *out_handle = handle as *mut core::ffi::c_void;
     }
 
     Arc::into_raw(Arc::new(WGPUTextureImpl {

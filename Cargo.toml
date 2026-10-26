@@ -114,6 +114,9 @@ ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
 hal = { workspace = true, features = ["dx12", "renderdoc"] }
+# Raw Vulkan handles for wgpuDeviceCreateTextureWithExportedWin32Handle, as for
+# the fd entry point above.
+ash = "0.38"
 
 [dependencies.wgt]
 workspace = true
@@ -137,3 +140,13 @@ bitflags = "2"
 
 [build-dependencies]
 bindgen = "0.72"
+
+# wgpu-hal 29.0.3 does not enable VK_ANDROID_external_memory_android_hardware_buffer,
+# and the extension list lives there rather than here — so exporting an
+# AHardwareBuffer for a texture's memory is impossible against the crates.io
+# build. This fork adds it alongside the external_memory_fd entry it already has.
+[patch.crates-io]
+wgpu-core = { git = "https://github.com/NucleantUI/wgpu.git", tag = "v29.0.3-ahb" }
+wgpu-hal = { git = "https://github.com/NucleantUI/wgpu.git", tag = "v29.0.3-ahb" }
+wgpu-types = { git = "https://github.com/NucleantUI/wgpu.git", tag = "v29.0.3-ahb" }
+naga = { git = "https://github.com/NucleantUI/wgpu.git", tag = "v29.0.3-ahb" }
